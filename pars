@@ -1,0 +1,1219 @@
+#!/usr/bin/env python3
+
+
+import socket
+
+import logging
+
+import iso8583
+
+import datetime
+
+from iso8583.specs import default_ascii as spec
+
+import json
+
+from kafka import KafkaProducer
+
+from confluent_kafka import Producer
+
+import hashlib
+
+import threading
+
+from queue import Queue
+
+import time
+
+import configparser
+
+
+config = configparser.ConfigParser()
+
+config.readfp(open(r'/home/hadoop/DCEMI_FailedTxn/data/config.txt'))
+
+username = config.get('Kafka', 'Username')
+
+password = config.get('Kafka', 'Password')
+
+data = config.get('Kafka', 'Brokers')
+
+servers = data.split(',')
+
+data2 = config.get('ISO', 'switch_ips')
+
+switch_ips = data2.split(',')
+
+switch_raw = config.get('Kafka', 'SwtichRaw')
+
+sucess_topic = config.get('Kafka', 'DCSucess')
+
+fail_topic = config.get('Kafka', 'DCFailed')
+
+switch_exception = config.get('Kafka', 'SwitchException')
+
+errorLogsDir = config.get('Generic', 'ErrorLogsDir')
+
+errorLogsPath = "{}/app.log".format(errorLogsDir)
+
+
+# s3URIDirErrorLogs = config.get('Generic', 'S3URIDirErrorLogs')
+
+
+spec['39'] = {'data_enc': 'ascii', 'len_enc': 'ascii',
+    'len_type': 0, 'max_len': 3, 'desc': 'Response Code'}
+
+spec['125'] = {'data_enc': 'ascii', 'len_enc': 'ascii',
+    'len_type': 0, 'max_len': 12, 'desc': 'Reserved for Private Use'}
+
+
+today = datetime.datetime.now()
+
+date_time = today.strftime("%m_%d_%Y")
+
+# log_file_name = "/home/hadoop/DCEMI_FailedTxn/logs/app.log"
+
+FORMAT = '%(asctime)s %(message)s'
+
+logging.basicConfig(filename=errorLogsPath, filemode='a', format=FORMAT)
+
+logger = logging.getLogger(__name__)
+
+logger.setLevel(logging.DEBUG)
+
+
+# Silence other loggers
+
+for log_name, log_obj in logging.Logger.manager.loggerDict.items():
+
+    if log_name != __name__:
+
+        log_obj.disabled = True
+
+# logging.getLogger('kafka').disbaled = True
+
+
+convertQueue = Queue()
+
+sockQueue1 = Queue()
+
+sockQueue2 = Queue()
+
+extraData1 = ""
+
+extraData2 = ""
+
+
+def ConvertSendKafka(servers, username, password, sucess_topic, fail_topic, switch_raw, switch_exception):
+
+    global convertQueue
+
+    print("Started Topic Streamer")
+
+    producer = KafkaProducer(bootstrap_servers=servers, value_serializer=lambda x: json.dumps(x).encode(
+        'utf-8'), security_protocol='SASL_SSL', sasl_mechanism='SCRAM-SHA-512', sasl_plain_username=username, sasl_plain_password=password)
+
+    # conf = {'bootstrap.servers': servers, 'group.id': 'mygroup', 'session.timeout.ms': 6000,'security.protocol' = 'SASL_SSL', 'sasl.mechanism' = 'SCRAM-SHA-512', 'sasl.plain.username' = 'admin', 'sasl.plain.password' = 'Kafka@2021'}
+
+    # producer = Producer(conf)
+
+    while True:
+
+        final_data = {"simpleHashCardNumber": "", "hashedCardNumber": "", "processingCode": "", "transactionAmount": "", "traceAuditNo": "",
+
+                      "localTransactionTime": "", "localTransactionDate": "", "merchantCategoryCode": "", "acquiringInstitutionCountryCode": "",
+
+                      "forwardingInstitutionId": "", "referenceNumber": "", "responseCode": "", "cardAcceptorNameLocation": "",
+
+                      "transportData": "", "crnNo": "", "cardType": "", "reasonCode": "", "txnIdentifier": "", "accountNumber": "",
+
+                      "channelIdentifier": "", "availableBalance": "0"}
+
+        try:
+
+            if not convertQueue.empty():
+
+                decoded_raw = convertQueue.get()
+
+                # decoded_raw = decoded_raw + "003ATM000000000000"
+
+                # check_raw = decoded_raw
+
+                # if decoded_raw[-3:].isalpha():
+
+                #    final_data['availableBalance'] = None
+
+                # else:
+
+                #    final_data['availableBalance'] = decoded_raw[-12:]
+
+                #    decoded_raw = decoded_raw[:-12] + "000"
+
+                # index = decoded_raw.index(" ")
+
+                # if len(decoded_raw) > index:
+
+                #    decoded_raw = decoded_raw[0 : index : ] + decoded_raw[index + 1 : :]
+
+                encoded_raw = decoded_raw.encode('utf-8')
+
+                try:
+
+                    decoded, encoded = iso8583.decode(encoded_raw, spec)
+
+                    # final_data['channelIdentifier'] = "1"
+
+                except Exception as e:
+
+                    # print("Couldn't Parse {}".format(decoded_raw))
+
+                    logger.debug(
+                        "Parse Exception Occured! {}\n{}".format(e, decoded_raw))
+
+                    try:
+
+                        producer.send(switch_exception, value=decoded_raw)
+
+                        producer.flush()
+
+                    except Exception as e:
+
+                        print("Couldn't log exception to kafka {}".format(
+                            decoded_raw))
+
+                        logger.debug(
+                            "Couldn't log exception to kafka {}\n{}".format(e, decoded_raw))
+
+                        pass
+
+                    continue
+
+                    # decoded_raw = encoded_raw.decode('utf-8')
+
+                    # final_data['channelIdentifier'] = decoded_raw[-3:]
+
+                    # decoded_raw = decoded_raw + "000000"
+
+                    # encoded_raw = decoded_raw.encode('utf-8')
+
+                    # try:
+
+                    #    decoded, encoded = iso8583.decode(check_raw.encode('utf-8','replace'), spec)
+
+                    # except:
+
+                    #    producer.send(switch_raw, value=check_raw)
+
+                    #    producer.flush()
+
+                    #    print("Sent to Kafka Switch RAW")
+
+                    #    pass
+
+                # print(decoded)
+
+                for key in decoded:
+
+                    # print(key, '->', a_dict[key])
+
+                    if key == 't':
+
+                        mti = decoded[key]
+
+                        # print(mti[:2])
+
+                        if mti[:2] in ['08', '18', '28', '38', '48', '58', '68', '78', '88', '98']:
+
+                            break
+
+                    elif key == '59':
+
+                        final_data['transportData'] = decoded[key]
+
+                        try:
+
+                            strlst = str(decoded[key]).split('|')
+
+                            final_data['crnNo'] = strlst[0]
+
+                            final_data['cardType'] = strlst[1]
+
+                            final_data['reasonCode'] = strlst[2]
+
+                            final_data['txnIdentifier'] = strlst[3]
+
+                        except Exception as e:
+
+                            pass
+
+                    elif key == '2':
+
+                        cardNum = decoded[key]
+
+                        # hashed_middle = hashlib.sha256(str(cardNum[6:12]).encode('utf-8')).hexdigest()
+
+                        final_data['simpleHashCardNumber'] = cardNum[:6] + \
+                            "XXXXXX" + cardNum[12:]
+
+                        hashed_cardNumber = hashlib.sha256(
+                            str("{}{}".format(decoded[key], "b+&KoBLeX$")).encode('utf-8'))
+
+                        final_data['hashedCardNumber'] = hashed_cardNumber.hexdigest()
+
+                    elif key == '3':
+
+                        final_data['processingCode'] = decoded[key]
+
+                    elif key == '4':
+
+                        final_data['transactionAmount'] = decoded[key]
+
+                    elif key == '11':
+
+                        final_data['traceAuditNo'] = decoded[key]
+
+                    elif key == '12':
+
+                        final_data['localTransactionTime'] = decoded[key]
+
+                    elif key == '13':
+
+                        final_data['localTransactionDate'] = decoded[key]
+
+                    elif key == '18':
+
+                        final_data['merchantCategoryCode'] = decoded[key]
+
+                    elif key == '19':
+
+                        final_data['acquiringInstitutionCountryCode'] = decoded[key]
+
+                    elif key == '33':
+
+                        final_data['forwardingInstitutionId'] = decoded[key]
+
+                    elif key == '37':
+
+                        final_data['referenceNumber'] = str(
+                            decoded[key]).strip().replace('\x00', '')
+
+                    elif key == '39':
+
+                        final_data['responseCode'] = decoded[key]
+
+                    elif key == '43':
+
+                        final_data['cardAcceptorNameLocation'] = decoded[key]
+
+                    elif key == '102':
+
+                        final_data['accountNumber'] = decoded[key]
+
+                    elif key == '123':
+
+                        final_data['channelIdentifier'] = decoded[key]
+
+                    elif key == '125':
+
+                        if decoded[key] == None:
+
+                            final_data['availableBalance'] = '0'
+
+                        else:
+
+                            final_data['availableBalance'] = decoded[key]
+
+                        # pass
+
+                # elif final_data['availableBalance'] == None:
+
+                #    final_data['availableBalance'] = '0'
+
+                # oneletter = final_data['cardAcceptorNameLocation']
+
+                # exoneletter = oneletter[:1]
+
+                # new_loc = oneletter[1:]
+
+                # final_data['cardAcceptorNameLocation'] = new_loc
+
+                # vals = final_data['responseCode']
+
+                # fin_vals = vals + "" + exoneletter
+
+                # final_data['responseCode'] = fin_vals
+
+                today1 = datetime.datetime.now()
+
+                year_date = today1.strftime("%y%m")
+
+                seconds_time = today1.strftime("%S")
+
+                today = datetime.datetime.now()
+
+                twelve = today.strftime("%I")
+
+                twenty_four = today.strftime("%H")
+
+                if final_data['localTransactionDate'] == year_date:
+
+                    date_raw = final_data['localTransactionDate'] + \
+                        "" + final_data['localTransactionTime']
+
+                    datee = date_raw[2:6]
+
+                    timee = date_raw[6:] + "" + seconds_time
+
+                    final_data['localTransactionDate'] = datee
+
+                    if timee[:2] == twelve:
+
+                        timee = twenty_four + "" + timee[2:]
+
+                        final_data['localTransactionTime'] = timee
+
+                    else:
+
+                        final_data['localTransactionTime'] = timee
+
+                else:
+
+                    pass
+
+                # logger.debug("Json Data\n{}\n{}\n".format(final_data,decoded_raw))
+
+                try:
+
+                    if final_data['responseCode'] == '000':
+
+                        producer.send(sucess_topic, value=final_data)
+
+                        producer.flush()
+
+                        # print("Sent to Success")
+
+                        # logger.debug("Sent to Success")
+
+                    else:
+
+                        producer.send(fail_topic, value=final_data)
+
+                        producer.flush()
+
+                        # print("Sent to Fail")
+
+                        # logger.debug("Sent to Fail")
+
+                    producer.send(switch_raw, value=final_data)
+
+                    producer.flush()
+
+                except Exception as e:
+
+                    logger.debug("Kakfka Exception Occured! {}".format(e))
+
+                    # print("Kafka Exception Occured! {}".format(e))
+
+                    producer = KafkaProducer(bootstrap_servers=servers, value_serializer=lambda x: json.dumps(x).encode(
+                        'utf-8'), security_protocol='SASL_SSL', sasl_mechanism='SCRAM-SHA-512', sasl_plain_username='admin', sasl_plain_password='Kafka@2021')
+
+                    if final_data['responseCode'] == '000':
+
+                        producer.send(sucess_topic, value=final_data)
+
+                        producer.flush()
+
+                        # logger.debug("Sent to Success")
+
+                        # print("Sent to Success")
+
+                    else:
+
+                        producer.send(fail_topic, value=final_data)
+
+                        producer.flush()
+
+                        # logger.debug("Sent tot Fail")
+
+                        # print("Sent tot Fail")
+
+                    producer.send(switch_raw, value=final_data)
+
+                    producer.flush()
+
+                    pass
+
+            else:
+
+                continue
+
+        except Exception as e:
+
+            logger.debug("Parser Exception Occured! {}".format(e))
+
+            # print("Parser Exception Occured! {}".format(e))
+
+            pass
+
+        # print("loop ended")
+
+
+def dataChecker1(data):
+
+    global convertQueue
+
+    global extraData1
+
+    try:
+
+        if extraData1 != "":
+
+            data = extraData1 + "" + data
+
+        firstTwo_bytes = data[:2]
+
+        try:
+
+            total_bytes = int(firstTwo_bytes, 16)
+
+        except:
+
+            extraData1 = data
+
+            return ""
+
+        data = data.replace('\n', '')
+
+        if total_bytes > 150:
+
+            if len(data[2:]) == total_bytes:
+
+                checkeddata = data[2:].replace('\\ufff', '')
+
+                checkeddata = checkeddata.encode(
+                    'ascii', 'replace').decode('ascii', 'replace')
+
+                convertQueue.put(checkeddata)
+
+                extraData1 = ""
+
+            elif len(data[2:]) > total_bytes:
+
+                checkeddata = data[2:(total_bytes+2)]
+
+                checkeddata = checkeddata.replace('\\ufff', '')
+
+                checkeddata = checkeddata.encode(
+                    'ascii', 'replace').decode('ascii', 'replace')
+
+                convertQueue.put(checkeddata)
+
+                remainingData = data[total_bytes+2:]
+
+                firstTwo_bytes = remainingData[:2]
+
+                try:
+
+                    total_bytes = int(firstTwo_bytes, 16)
+
+                except:
+
+                    extraData1 = remainingData
+
+                    return ""
+
+                if total_bytes > 150:
+
+                    if len(remainingData[2:]) == total_bytes:
+
+                        checkeddata = remainingData[2:]
+
+                        checkeddata = checkeddata.replace('\\ufff', '')
+
+                        checkeddata = checkeddata.encode(
+                            'ascii', 'replace').decode('ascii', 'replace')
+
+                        convertQueue.put(checkeddata)
+
+                        extraData1 = ""
+
+                    elif len(remainingData[2:]) > total_bytes:
+
+                        checkeddata = remainingData[2:(total_bytes+2)]
+
+                        checkeddata = checkeddata.replace('\\ufff', '')
+
+                        checkeddata = checkeddata.encode(
+                            'ascii', 'replace').decode('ascii', 'replace')
+
+                        convertQueue.put(checkeddata)
+
+                        remainingData2 = remainingData[total_bytes+2:]
+
+                        firstTwo_bytes = remainingData2[:2]
+
+                        try:
+
+                            total_bytes = int(firstTwo_bytes, 16)
+
+                        except:
+
+                            extraData1 = remainingData2
+
+                            return ""
+
+                        if total_bytes > 150:
+
+                            if len(remainingData2[2:]) == total_bytes:
+
+                                checkeddata = remainingData2[2:]
+
+                                checkeddata = checkeddata.replace('\\ufff', '')
+
+                                checkeddata = checkeddata.encode(
+                                    'ascii', 'replace').decode('ascii', 'replace')
+
+                                convertQueue.put(checkeddata)
+
+                                extraData1 = ""
+
+                            elif len(remainingData2[2:]) > total_bytes:
+
+                                checkeddata = remainingData2[2:(total_bytes+2)]
+
+                                checkeddata = checkeddata.replace('\\ufff', '')
+
+                                checkeddata = checkeddata.encode(
+                                    'ascii', 'replace').decode('ascii', 'replace')
+
+                                convertQueue.put(checkeddata)
+
+                                remainingData3 = remainingData2[total_bytes+2:]
+
+                                firstTwo_bytes = remainingData3[:2]
+
+                                try:
+
+                                    total_bytes = int(firstTwo_bytes, 16)
+
+                                except:
+
+                                    extraData1 = remainingData3
+
+                                    return ""
+
+                                if total_bytes > 150:
+
+                                    if len(remainingData3[2:]) == total_bytes:
+
+                                        checkeddata = remainingData3[2:]
+
+                                        checkeddata = checkeddata.replace(
+                                            '\\ufff', '')
+
+                                        checkeddata = checkeddata.encode(
+                                            'ascii', 'replace').decode('ascii', 'replace')
+
+                                        convertQueue.put(checkeddata)
+
+                                        extraData1 = ""
+
+                                    elif len(remainingData3[2:]) > total_bytes:
+
+                                        checkeddata = remainingData3[2:(
+                                            total_bytes+2)]
+
+                                        checkeddata = checkeddata.replace(
+                                            '\\ufff', '')
+
+                                        checkeddata = checkeddata.encode(
+                                            'ascii', 'replace').decode('ascii', 'replace')
+
+                                        convertQueue.put(checkeddata)
+
+                                        extraData1 = remainingData3[(
+                                            total_bytes+2):]
+
+                                    else:
+
+                                        extraData1 = remainingData3
+
+                                else:
+
+                                    pass
+
+                            else:
+
+                                extraData1 = remainingData2
+
+                        else:
+
+                            pass
+
+                    else:
+
+                        extraData1 = remainingData
+
+                else:
+
+                    pass
+
+            else:
+
+                extraData1 = data
+
+        else:
+
+            pass
+
+    except Exception as e:
+
+        logger.debug("Error \n{}\n".format(e, data))
+
+        # print("Error \n{}\n{}".format(e,data))
+
+        pass
+
+    return ""
+
+
+def dataChecker2(data):
+
+    global convertQueue
+
+    global extraData2
+
+    try:
+
+        if extraData2 != "":
+
+            data = extraData2 + "" + data
+
+        firstTwo_bytes = data[:2]
+
+        try:
+
+            total_bytes = int(firstTwo_bytes, 16)
+
+        except:
+
+            extraData2 = data
+
+            return ""
+
+        data = data.replace('\n', '')
+
+        if total_bytes > 150:
+
+            if len(data[2:]) == total_bytes:
+
+                checkeddata = data[2:].replace('\\ufff', '')
+
+                checkeddata = checkeddata.encode(
+                    'ascii', 'replace').decode('ascii', 'replace')
+
+                convertQueue.put(checkeddata)
+
+                extraData2 = ""
+
+            elif len(data[2:]) > total_bytes:
+
+                checkeddata = data[2:(total_bytes+2)]
+
+                checkeddata = checkeddata.replace('\\ufff', '')
+
+                checkeddata = checkeddata.encode(
+                    'ascii', 'replace').decode('ascii', 'replace')
+
+                convertQueue.put(checkeddata)
+
+                remainingData = data[total_bytes+2:]
+
+                firstTwo_bytes = remainingData[:2]
+
+                try:
+
+                    total_bytes = int(firstTwo_bytes, 16)
+
+                except:
+
+                    extraData2 = remainingData
+
+                    return ""
+
+                if total_bytes > 150:
+
+                    if len(remainingData[2:]) == total_bytes:
+
+                        checkeddata = remainingData[2:]
+
+                        checkeddata = checkeddata.replace('\\ufff', '')
+
+                        checkeddata = checkeddata.encode(
+                            'ascii', 'replace').decode('ascii', 'replace')
+
+                        convertQueue.put(checkeddata)
+
+                        extraData2 = ""
+
+                    elif len(remainingData[2:]) > total_bytes:
+
+                        checkeddata = remainingData[2:(total_bytes+2)]
+
+                        checkeddata = checkeddata.replace('\\ufff', '')
+
+                        checkeddata = checkeddata.encode(
+                            'ascii', 'replace').decode('ascii', 'replace')
+
+                        convertQueue.put(checkeddata)
+
+                        remainingData2 = remainingData[total_bytes+2:]
+
+                        firstTwo_bytes = remainingData2[:2]
+
+                        try:
+
+                            total_bytes = int(firstTwo_bytes, 16)
+
+                        except:
+
+                            extraData2 = remainingData2
+
+                            return ""
+
+                        if total_bytes > 150:
+
+                            if len(remainingData2[2:]) == total_bytes:
+
+                                checkeddata = remainingData2[2:]
+
+                                checkeddata = checkeddata.replace('\\ufff', '')
+
+                                checkeddata = checkeddata.encode(
+                                    'ascii', 'replace').decode('ascii', 'replace')
+
+                                convertQueue.put(checkeddata)
+
+                                extraData2 = ""
+
+                            elif len(remainingData2[2:]) > total_bytes:
+
+                                checkeddata = remainingData2[2:(total_bytes+2)]
+
+                                checkeddata = checkeddata.replace('\\ufff', '')
+
+                                checkeddata = checkeddata.encode(
+                                    'ascii', 'replace').decode('ascii', 'replace')
+
+                                convertQueue.put(checkeddata)
+
+                                remainingData3 = remainingData2[total_bytes+2:]
+
+                                firstTwo_bytes = remainingData3[:2]
+
+                                try:
+
+                                    total_bytes = int(firstTwo_bytes, 16)
+
+                                except:
+
+                                    extraData2 = remainingData3
+
+                                    return ""
+
+                                if total_bytes > 150:
+
+                                    if len(remainingData3[2:]) == total_bytes:
+
+                                        checkeddata = remainingData3[2:]
+
+                                        checkeddata = checkeddata.replace(
+                                            '\\ufff', '')
+
+                                        checkeddata = checkeddata.encode(
+                                            'ascii', 'replace').decode('ascii', 'replace')
+
+                                        convertQueue.put(checkeddata)
+
+                                        extraData2 = ""
+
+                                    elif len(remainingData3[2:]) > total_bytes:
+
+                                        checkeddata = remainingData3[2:(
+                                            total_bytes+2)]
+
+                                        checkeddata = checkeddata.replace(
+                                            '\\ufff', '')
+
+                                        checkeddata = checkeddata.encode(
+                                            'ascii', 'replace').decode('ascii', 'replace')
+
+                                        convertQueue.put(checkeddata)
+
+                                        extraData2 = remainingData3[(
+                                            total_bytes+2):]
+
+                                    else:
+
+                                        extraData2 = remainingData3
+
+                                else:
+
+                                    pass
+
+                            else:
+
+                                extraData2 = remainingData2
+
+                        else:
+
+                            pass
+
+                    else:
+
+                        extraData2 = remainingData
+
+                else:
+
+                    pass
+
+            else:
+
+                extraData2 = data
+
+        else:
+
+            pass
+
+    except Exception as e:
+
+        logger.debug("Error \n{}\n".format(e, data))
+
+        # print("Error \n{}\n{}".format(e,data))
+
+        pass
+
+    return ""
+
+
+def sockThread1(sock, switch_ips):
+
+    global convertQueue
+
+    print("Started Socket")
+
+    while True:
+
+        try:
+
+            conn, addr = sock.accept()
+
+            print('Connected by', addr)
+
+            logger.debug('Connected by {}'.format(addr))
+
+            if str(addr[0]) in switch_ips:
+
+                while True:
+
+                    try:
+
+                        data = conn.recv(5000).decode(
+                            'ascii', errors='replace')
+
+                        # 1024 256
+
+                        if not data:
+
+                            logger.debug(
+                                "Connection Closed by {}".format(addr[0]))
+
+                            print("Connection Closed by {}".format(addr[0]))
+
+                            conn.close()
+
+                            break
+
+                        if str(data).strip() == '':
+
+                            continue
+
+                       dataChecker1(data)
+
+                        #print("{}....Raw \n{}\n".format(addr[0],data))
+
+                        #logger.debug("Raw \n{}\n".format(data))
+
+                    except socket.timeout:
+
+                        logger.debug(" Timeout ")
+
+                        conn.close()
+
+                        break
+
+                    except Exception as e:
+
+                        logger.debug("Receive Exception! {}".format(e))
+
+                        conn.close()
+
+                        break
+
+            else:
+
+                logger.debug("Other Source Connections {} Closed!".format(addr))
+
+                #print("Other Source Connections {} Closed!".format(addr))
+
+                conn.close()
+
+        except socket.timeout:
+
+            logger.debug("Switch not connecting")
+
+            pass
+
+        except Exception as e:
+
+            logger.debug("Error \n{}".format(e))
+
+            #print("Error \n{}".format(e))
+
+            pass
+
+ 
+
+ 
+
+def sockThread2(sock, switch_ips):
+
+    global convertQueue
+
+    print("Started Socket")
+
+    while True:
+
+        try:
+
+            conn, addr = sock.accept()
+
+            print('Connected by', addr)
+
+            logger.debug('Connected by {}'.format(addr))
+
+            if str(addr[0]) in switch_ips:
+
+                while True:
+
+                    try:
+
+                        data = conn.recv(5000).decode('ascii', errors='replace')
+
+                        # 1024 256
+
+                        if not data:
+
+                            logger.debug("Connection Closed by {}".format(addr[0]))
+
+                            print("Connection Closed by {}".format(addr[0]))
+
+                            conn.close()
+
+                            break
+
+                        if str(data).strip() == '':
+
+                            continue
+
+                        dataChecker2(data)
+
+                        #print("{}....Raw \n{}\n".format(addr[0],data))
+
+                        #logger.debug("Raw \n{}\n".format(data))
+
+                    except socket.timeout:
+
+                        logger.debug(" Timeout ")
+
+                        conn.close()
+
+                        break
+
+                    except Exception as e:
+
+                        logger.debug("Receive Exception! {}".format(e))
+
+                        conn.close()
+
+                        break
+
+            else:
+
+                logger.debug("Other Source Connections {} Closed!".format(addr))
+
+                #print("Other Source Connections {} Closed!".format(addr))
+
+                conn.close()
+
+        except socket.timeout:
+
+            logger.debug("Switch not connecting")
+
+            pass
+
+        except Exception as e:
+
+            logger.debug("Error \n{}".format(e))
+
+            #print("Error \n{}".format(e))
+
+            pass
+
+ 
+
+ 
+
+def sockServer(HOST, PORT, switch_ips):
+
+    sock_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    sock_conn.bind((HOST, PORT))
+
+    sock_conn.settimeout(300)
+
+    sock_conn.listen()
+
+    sock_thread1 = threading.Thread(target=sockThread1, args=(sock_conn,switch_ips,))
+
+    sock_thread1.start()
+
+    sock_thread2 = threading.Thread(target=sockThread2, args=(sock_conn,switch_ips,))
+
+    sock_thread2.start()
+
+ 
+
+ 
+
+if __name__ == '__main__':
+
+    #global fail_topic, sucess_topic, switch_raw, switch_exception, servers, username, password, switch_ips
+
+    # Config Params
+
+    #servers = ['b-3.dcemi-kafka1.a9dz0i.c4.kafka.ap-south-1.amazonaws.com:9096','b-1.dcemi-kafka1.a9dz0i.c4.kafka.ap-south-1.amazonaws.com:9096','b-2.dcemi-kafka1.a9dz0i.c4.kafka.ap-south-1.amazonaws.com:9096']
+
+    #servers = ['z-3.bigdata-kafka.mhttef.c2.kafka.ap-south-1.amazonaws.com:2181','z-1.bigdata-kafka.mhttef.c2.kafka.ap-south-1.amazonaws.com:2181','z-2.bigdata-kafka.mhttef.c2.kafka.ap-south-1.amazonaws.com:2181']
+
+    #servers = ['b-1.bigdata-kafka.mhttef.c2.kafka.ap-south-1.amazonaws.com:9096','b-3.bigdata-kafka.mhttef.c2.kafka.ap-south-1.amazonaws.com:9096','b-2.bigdata-kafka.mhttef.c2.kafka.ap-south-1.amazonaws.com:9096']
+
+    #servers = 'b-1.bigdata-kafka.mhttef.c2.kafka.ap-south-1.amazonaws.com:9096,b-3.bigdata-kafka.mhttef.c2.kafka.ap-south-1.amazonaws.com:9096,b-2.bigdata-kafka.mhttef.c2.kafka.ap-south-1.amazonaws.com:9096'
+
+    #servers = ['b-1.bigdata-kafka-prod.4po6du.c2.kafka.ap-south-1.amazonaws.com:9096','b-2.bigdata-kafka-prod.4po6du.c2.kafka.ap-south-1.amazonaws.com:9096','b-3.bigdata-kafka-prod.4po6du.c2.kafka.ap-south-1.amazonaws.com:9096']
+
+    #fail_topic = 'dc-failed'
+
+    #sucess_topic = 'dcsuccess'
+
+    #switch_raw = 'switch_raw'
+
+    #switch_exception = 'switch_exception'
+
+    hostname = '10.51.18.49'
+
+    # Port to listen on (non-privileged ports are > 1023)
+
+    portnumber = 8000
+
+    #username = 'admin'
+
+    #password = 'Kafka@2021'
+
+    #switch_ips = ['10.50.3.225','10.240.70.21','10.240.70.22']
+
+    # Start Socket
+
+    sockServer(hostname, portnumber, switch_ips)
+
+    # Start Conversion & Kafka producer
+
+    t1 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t2 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t3 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t4 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t5 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t6 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t7 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t8 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t9 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t10 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t11 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t12 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t13 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t14 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t15 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t16 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t17 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t18 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t19 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t20 = threading.Thread(target=ConvertSendKafka, args=(servers,username,password,sucess_topic,fail_topic,switch_raw,switch_exception,))
+
+    t1.start()
+
+    t2.start()
+
+    t3.start()
+
+    t4.start()
+
+    t5.start()
+
+    t6.start()
+
+    t7.start()
+
+    t8.start()
+
+    t9.start()
+
+    t10.start()
+
+    t11.start()
+
+    t12.start()
+
+    t13.start()
+
+    t14.start()
+
+    t15.start()
+
+    t16.start()
+
+    t17.start()
+
+    t18.start()
+
+    t19.start()
+
+    t20.start()
